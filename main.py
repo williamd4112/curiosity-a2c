@@ -19,6 +19,8 @@ from storage import RolloutStorage
 from utils import get_vec_normalize
 from visualize import visdom_plot
 
+from icm import ICM
+
 args = get_args()
 
 assert args.algo in ['a2c', 'ppo', 'acktr']
@@ -48,6 +50,16 @@ except OSError:
     for f in files:
         os.remove(f)
 
+def train_icm(icm, rollouts):
+    obs_shape = rollouts.obs.size()[2:]
+    action_shape = rollouts.actions.size()[-1]
+    num_steps, num_processes, _ = rollouts.rewards.size()
+
+    obses = rollouts.obs[:-1].view(-1, *obs_shape)
+    actions = rollouts.actions.view(-1, action_shape)
+    obses_next = rollouts.obs[1:].view(-1, *obs_shape)
+    fwd_loss, inv_loss, loss = icm.train(obses, actions, obses_next)
+    return fwd_loss.view(num_steps, num_processes, 1).detach()
 
 def main():
     torch.set_num_threads(1)
@@ -55,7 +67,7 @@ def main():
 
     if args.vis:
         from visdom import Visdom
-        viz = Visdom(port=args.port)
+        viz = Visdom(port=args.port, env=args.algo)
         win = None
 
     envs = make_vec_envs(args.env_name, args.seed, args.num_processes,
@@ -64,6 +76,9 @@ def main():
     actor_critic = Policy(envs.observation_space.shape, envs.action_space,
         base_kwargs={'recurrent': args.recurrent_policy})
     actor_critic.to(device)
+    icm = ICM(envs.observation_space.shape, envs.action_space)
+    if args.cuda:
+        icm = icm.cuda()
 
     if args.algo == 'a2c':
         agent = algo.A2C_ACKTR(actor_critic, args.value_loss_coef,
@@ -88,7 +103,7 @@ def main():
     rollouts.to(device)
 
     episode_rewards = deque(maxlen=10)
-
+    
     start = time.time()
     for j in range(num_updates):
         for step in range(args.num_steps):
@@ -115,10 +130,9 @@ def main():
             next_value = actor_critic.get_value(rollouts.obs[-1],
                                                 rollouts.recurrent_hidden_states[-1],
                                                 rollouts.masks[-1]).detach()
-
-        rollouts.compute_returns(next_value, args.use_gae, args.gamma, args.tau)
-
-        value_loss, action_loss, dist_entropy = agent.update(rollouts)
+        intrinsic_rewards = train_icm(icm, rollouts)
+        rollouts.compute_returns(next_value, intrinsic_rewards, args.use_gae, args.gamma, args.tau)
+        value_loss, action_loss, dist_entropy = agent.update(rollouts, intrinsic_rewards)
 
         rollouts.after_update()
 
@@ -152,6 +166,12 @@ def main():
                        np.min(episode_rewards),
                        np.max(episode_rewards), dist_entropy,
                        value_loss, action_loss))
+            intrinsic_rewards = intrinsic_rewards.cpu().numpy()
+            print(' Intrinsic rewards mean/median/min/max: {:.5f}/{:.5f}/{:.5f}/{:.5f}'.format(
+                        np.mean(intrinsic_rewards),
+                        np.median(intrinsic_rewards),
+                        np.min(intrinsic_rewards),
+                        np.max(intrinsic_rewards)))
 
         if (args.eval_interval is not None
                 and len(episode_rewards) > 1
